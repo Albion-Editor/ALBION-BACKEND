@@ -1,0 +1,76 @@
+# =============================================================================
+# Albion Proxy - LiteLLM Configuration
+# =============================================================================
+#
+# HOW THIS INTEGRATES WITH server.js:
+# 1. Your proxy calls LiteLLM via HTTP POST to ${LITELLM_BASE_URL}/chat/completions
+# 2. LiteLLM uses this config to route 'deepseek-v4-flash' → DeepInfra
+# 3. If DeepInfra fails, LiteLLM auto-retries with 'together-failover' model
+# 4. Spend is tracked per API key (master_key) for cost monitoring
+# 5. NEVER call providers directly — always go through LiteLLM for failover + tracking
+#
+# AUTONOMOUS BILLING SAFETY:
+# DeepInfra and Together AI charge the connected card automatically.
+# server.js enforces pre-request cap checks BEFORE calling this proxy.
+# LiteLLM tracks spend per user/session for reconciliation.
+# max_budget acts as a hard ceiling safety net.
+# =============================================================================
+
+model_list:
+  # PRIMARY: DeepInfra DeepSeek V4 Flash (Learner Tier / Fallback)
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: deepinfra/deepseek-ai/DeepSeek-V4-Flash
+      api_key: os.environ/DEEPINFRA_API_KEY
+      api_base: https://api.deepinfra.com/v1/openai
+
+  # PREMIUM: DeepInfra DeepSeek V4 Pro (Starter/Pro Tiers)
+  - model_name: deepseek-v4-pro
+    litellm_params:
+      model: deepinfra/deepseek-ai/DeepSeek-V4-Pro
+      api_key: os.environ/DEEPINFRA_API_KEY
+      api_base: https://api.deepinfra.com/v1/openai
+
+  # MULTIMODAL / IMAGES: Qwen3.6-35B-A3B (Routine tasks with image context)
+  - model_name: qwen3.6-35b-a3b
+    litellm_params:
+      model: deepinfra/Qwen/Qwen3.6-35B-A3B
+      api_key: os.environ/DEEPINFRA_API_KEY
+      api_base: https://api.deepinfra.com/v1/openai
+
+  # DESIGN / UI TASKS: GLM-5.2 (UI generation, design workflows)
+  - model_name: glm-5.2
+    litellm_params:
+      model: deepinfra/THUDM/GLM-5.2
+      api_key: os.environ/DEEPINFRA_API_KEY
+      api_base: https://api.deepinfra.com/v1/openai
+
+  # FAILOVER: Together AI DeepSeek V4
+  - model_name: together-failover
+    litellm_params:
+      model: deepseek-ai/DeepSeek-V4
+      api_key: os.environ/TOGETHER_API_KEY
+      api_base: https://api.together.xyz/v1
+
+  # FREE TIER PRIMARY: OpenRouter Free
+  - model_name: openrouter-free
+    litellm_params:
+      model: openrouter/cohere/north-mini-code:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      api_base: https://openrouter.ai/api/v1
+      tags: ["provider:openrouter", "cost:free"]
+
+  # FREE TIER FALLBACK: Groq Free
+  - model_name: groq-free
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+      api_base: https://api.groq.com/openai/v1
+      tags: ["provider:groq", "cost:free"]
+
+general_settings:
+  master_key: sk-albion-proxy-key-CHANGE-ME-IN-PROD
+  database_url: os.environ/DATABASE_URL
+  spend_tracking: true
+  max_budget: 50.0  # Alpha safety cap: $50/month across all users to prevent runaway costs
+  alerting: ["email"]  # Alert when 70% of max_budget is reached
