@@ -23,6 +23,19 @@ const { createClient } = require('@supabase/supabase-js');
 const Sentry = require('@sentry/node');
 const { rateLimit, MemoryStore } = require('express-rate-limit');
 require('dotenv').config();
+const {
+	FREE_TIER_MODEL_ID,
+	DEFAULT_DEEPINFRA_FLASH_MODEL,
+	DEFAULT_OPENROUTER_FLASH_MODEL,
+	getFreeTierTokenCap,
+	evaluateFreeTierRequest,
+	computeTokenCost,
+	estimateMessagesTokens,
+	estimateTextTokens,
+	extractUsageFromSseChunk,
+	extractCompletionTextFromSseChunk
+} = require('./lib/freeTierPolicy');
+const { createFreeTierAccounting } = require('./lib/freeTierAccounting');
 
 function pipeResponseBody(fetchResponse, res) {
   if (fetchResponse.body && typeof fetchResponse.body.pipe === 'function') {
@@ -146,77 +159,46 @@ const LEMONSQUEEZY_WEBHOOK_SECRET = process.env.LEMONSQUEEZY_WEBHOOK_SECRET || '
 const LEMONSQUEEZY_API_KEY = process.env.LEMONSQUEEZY_API_KEY || '';
 const LEMONSQUEEZY_STORE_ID = process.env.LEMONSQUEEZY_STORE_ID || '';
 
-// --- Free Tier Cloud Providers (Stacked Failover & API Key Rotation) ---
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+// --- Free Tier: single-provider routing (NO fallbacks, NO Groq) ---
+// The free tier consumes the paid DeepSeek V4.1 Flash model from the Albion
+// wallet. It is intentionally limited by a lifetime token cap, not by provider
+// rate limits, so a long-running user is never interrupted mid-session.
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
-const GROQ_ENDPOINT = process.env.GROQ_ENDPOINT || 'https://api.groq.com/openai/v1/chat/completions';
-const OPENROUTER_FREE_MODEL = process.env.OPENROUTER_FREE_MODEL || 'cohere/north-mini-code:free';
-const OPENROUTER_FALLBACK_MODELS = ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free', 'nvidia/nemotron-3-super-120b-a12b:free'];
-const GROQ_FREE_MODEL = process.env.GROQ_FREE_MODEL || 'llama-3.1-8b-instant';
+const OPENROUTER_PAID_MODEL = process.env.OPENROUTER_PAID_MODEL || DEFAULT_OPENROUTER_FLASH_MODEL;
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || '').trim();
+const FREE_TIER_PROVIDER = (process.env.FREE_TIER_PROVIDER || '').trim().toLowerCase();
+const FREE_TIER_TOKEN_CAP = getFreeTierTokenCap();
 
 // --- Paid AI Cloud Providers (DeepInfra Native Routing) ---
-const DEEPINFRA_API_KEY = process.env.DEEPINFRA_API_KEY || '';
+const DEEPINFRA_API_KEY = (process.env.DEEPINFRA_API_KEY || '').trim();
 const DEEPINFRA_ENDPOINT = process.env.DEEPINFRA_ENDPOINT || 'https://api.deepinfra.com/v1/openai/chat/completions';
 const DEEPINFRA_MODEL_MAP = {
-  'deepseek-v4-flash': 'deepseek-ai/DeepSeek-V3',
-  'deepseek-v4-pro': 'deepseek-ai/DeepSeek-R1',
-  'qwen3.6-35b-a3b': 'Qwen/Qwen2.5-Coder-32B-Instruct',
-  'glm-5.2': 'deepseek-ai/DeepSeek-V3'
+  'deepseek-v4-flash': process.env.DEEPINFRA_FLASH_MODEL || DEFAULT_DEEPINFRA_FLASH_MODEL,
+  'deepseek-v4-pro': process.env.DEEPINFRA_PRO_MODEL || 'deepseek-ai/DeepSeek-R1',
+  'qwen3.6-35b-a3b': process.env.DEEPINFRA_QWEN_MODEL || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+  'glm-5.2': process.env.DEEPINFRA_GLM_MODEL || 'deepseek-ai/DeepSeek-V3'
 };
 
-// ---------------------------------------------------------------------------
-// API KEY ROTATION & RATE LIMIT RESILIENCE (Phase 4.5)
-// Supports multi-key array for OpenRouter: OPENROUTER_API_KEY_1, OPENROUTER_API_KEY_2, etc.
-// Round-robin cycling with immediate failover retry on 429 (Too Many Requests) or 503.
-// ---------------------------------------------------------------------------
-let currentKeyIndex = 0;
-
+// Single primary key compatibility helpers. Multi-key rotation is retired so a
+// provider failure always surfaces as HTTP 503 instead of silently switching.
 function loadOpenRouterKeys() {
-  const keys = [];
-  // 1. Look for indexed keys: OPENROUTER_API_KEY_1, OPENROUTER_API_KEY_2, ...
-  let i = 1;
-  while (process.env[`OPENROUTER_API_KEY_${i}`]) {
-    const k = process.env[`OPENROUTER_API_KEY_${i}`].trim();
-    if (k && !keys.includes(k)) keys.push(k);
-    i++;
-  }
-  // 2. Also check base OPENROUTER_API_KEY
-  if (process.env.OPENROUTER_API_KEY) {
-    const k = process.env.OPENROUTER_API_KEY.trim();
-    if (k && !keys.includes(k)) keys.unshift(k);
-  }
-  // 3. Also check comma-separated OPENROUTER_API_KEYS
-  if (process.env.OPENROUTER_API_KEYS) {
-    const split = process.env.OPENROUTER_API_KEYS.split(',').map(s => s.trim()).filter(Boolean);
-    for (const s of split) {
-      if (!keys.includes(s)) keys.push(s);
-    }
-  }
-  return keys;
+  return OPENROUTER_API_KEY ? [OPENROUTER_API_KEY] : [];
 }
 
 function getApiKey() {
-  const keys = loadOpenRouterKeys();
-  if (keys.length === 0) return process.env.OPENROUTER_API_KEY || '';
-  return keys[currentKeyIndex % keys.length];
+  return OPENROUTER_API_KEY;
 }
 
 function rotateApiKey() {
-  const keys = loadOpenRouterKeys();
-  if (keys.length <= 1) return getApiKey();
-  const prevIndex = currentKeyIndex;
-  currentKeyIndex = (currentKeyIndex + 1) % keys.length;
-  console.log(`[KEY-ROTATION] Rotated OpenRouter API key from index ${prevIndex} to ${currentKeyIndex} (total keys: ${keys.length})`);
-  return keys[currentKeyIndex];
+  return OPENROUTER_API_KEY;
 }
 
 function resetKeyRotation() {
-  currentKeyIndex = 0;
+  // Retained for API compatibility.
 }
 
-const OPENROUTER_API_KEY = getApiKey();
-
-const DAILY_FREE_LIMIT_MESSAGE = 'Daily free cloud AI limit reached. Please upgrade to the Learner tier ($3) for premium cloud access.';
+const FREE_TIER_LIMIT_MESSAGE = `Free tier lifetime limit reached (${Math.round(FREE_TIER_TOKEN_CAP / 1000)}k tokens). Please upgrade to continue.`;
+const DAILY_FREE_LIMIT_MESSAGE = FREE_TIER_LIMIT_MESSAGE;
 
 // ---------------------------------------------------------------------------
 // SUPABASE CLIENT (service role — server-side only, never expose to client)
@@ -226,6 +208,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+const freeTierAccounting = createFreeTierAccounting(supabase);
+
 // ---------------------------------------------------------------------------
 // TIER CAPS — tokens per billing cycle (Retention-First Math)
 // -1 indicates unlimited ($0 cloud free tier models).
@@ -233,8 +217,7 @@ const supabase = createClient(
 // ---------------------------------------------------------------------------
 const tierCaps = {
   free: {
-    'openrouter-free': -1,
-    'groq-free': -1
+    [FREE_TIER_MODEL_ID]: FREE_TIER_TOKEN_CAP
   },
   learner: {
     'deepseek-v4-flash': 2000000
@@ -254,7 +237,10 @@ const tierCaps = {
 };
 
 const PREMIUM_TOGGLE_MODELS = new Set(['deepseek-v4-pro', 'glm-5.2']);
-const FREE_TIER_MODELS = new Set(['openrouter-free', 'groq-free']);
+// Retained for backwards compatibility with older imports/tests. Routing uses
+// capResult.isFreeTier so a paid user on deepseek-v4-flash is never treated as
+// a free-tier user.
+const FREE_TIER_MODELS = new Set([FREE_TIER_MODEL_ID]);
 
 // ---------------------------------------------------------------------------
 // EXPRESS APP
@@ -275,7 +261,11 @@ app.use(cors({
     'X-Albion-Usage-Warning',
     'X-Albion-Current-Tokens',
     'X-Albion-Cap-Tokens',
-    'X-Albion-Caps-Summary'
+    'X-Albion-Caps-Summary',
+    'X-Albion-Free-Tier-Tokens-Used',
+    'X-Albion-Free-Tier-Token-Cap',
+    'X-Albion-Free-Tier-Remaining',
+    'X-Albion-Free-Tier-Cost-Usd'
   ]
 }));
 
@@ -350,19 +340,10 @@ async function authenticate(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// FREE TIER DAILY PER-USER LIMITS
-// 50 requests per day OR 50,000 tokens per day, reset at midnight UTC.
-// ---------------------------------------------------------------------------
-const FREE_TIER_DAILY_REQUEST_LIMIT = 50;
-const FREE_TIER_DAILY_TOKEN_LIMIT = 50000;
-
-// ---------------------------------------------------------------------------
 // CAP CHECK & INTELLIGENT ROUTER: checkCapBeforeRoute
-// Enforces 4 routing rules in exact priority order:
-//   a. Free tier -> checks 50 msg / 50k token daily limits. If exceeded, blocks pre-flight.
-//   b. Paid tier with remaining caps -> intelligent router (flash/qwen auto; pro/glm ONLY via toggle)
-//   c. Paid tier, ALL paid caps exhausted -> force muse-glimmer + all_caps_exhausted warning
-//   d. Hard guard against paid model leaks
+// Rule a: Free tier -> 200,000 token LIFETIME hard cap. Never resets.
+// Rule b: Paid tier -> intelligent router with per-model cycle caps.
+// Rule c: Paid tier caps exhausted -> 402 (no free/Groq fallback).
 // ---------------------------------------------------------------------------
 async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = false, estimatedTokens = 1000 } = {}) {
   // 1. Get user's active subscription
@@ -385,68 +366,79 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
   }
   const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
 
-  // Calculate midnight UTC start of day
-  const now = new Date();
-  const startOfDayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-  const todayDateStr = startOfDayUTC.toISOString().slice(0, 10);
-
-  // Compute Daily Usage for Free Tier tracking
-  let dailyRequests = 0;
-  let dailyTokens = 0;
-
-  // 1a. Check subscription table columns if present and not reset
-  if (subscription) {
-    const resetDate = subscription.daily_reset_date ? String(subscription.daily_reset_date).slice(0, 10) : null;
-    if (resetDate === todayDateStr) {
-      dailyRequests = Number(subscription.daily_request_count) || 0;
-      dailyTokens = Number(subscription.daily_token_count) || 0;
-    }
-  }
-
-  // 1b. Also aggregate daily usage from usage_logs (since midnight UTC)
-  try {
-    const { data: dayLogs, error: dayLogsErr } = await supabase
-      .from('usage_logs')
-      .select('prompt_tokens, completion_tokens')
-      .eq('user_id', userId)
-      .gte('timestamp', startOfDayUTC.toISOString());
-
-    if (!dayLogsErr && Array.isArray(dayLogs)) {
-      const logsCount = dayLogs.length;
-      const logsTokens = dayLogs.reduce((acc, row) => acc + (row.prompt_tokens || 0) + (row.completion_tokens || 0), 0);
-      dailyRequests = Math.max(dailyRequests, logsCount);
-      dailyTokens = Math.max(dailyTokens, logsTokens);
-    }
-  } catch (err) {
-    console.warn(`[CAP] Error aggregating daily logs for user ${userId}:`, err.message);
-  }
-
-  // Rule a: Free tier DAILY CAP CHECK (50 requests OR 50,000 tokens)
+  // Rule a: Free tier LIFETIME CAP CHECK
   if (tier === 'free') {
-    const capExceeded = dailyRequests >= FREE_TIER_DAILY_REQUEST_LIMIT || dailyTokens >= FREE_TIER_DAILY_TOKEN_LIMIT;
+    let usage;
+    try {
+      usage = await freeTierAccounting.getUsage(userId);
+    } catch (err) {
+      console.error(`[CAP] Free tier accounting unavailable for ${userId}:`, err.message);
+      return {
+        tier: 'free',
+        targetModel: FREE_TIER_MODEL_ID,
+        isFreeTier: true,
+        accountingError: true,
+        error: 'Free tier accounting is temporarily unavailable. Please try again shortly.',
+        capExceeded: true,
+        lifetimeTokens: 0,
+        lifetimeCap: FREE_TIER_TOKEN_CAP,
+        lifetimeRemaining: FREE_TIER_TOKEN_CAP,
+        lifetimePercent: 0,
+        allCapsExhausted: false,
+        warning: 'free_tier_accounting_unavailable',
+        usagePercent: 0,
+        currentUsage: 0,
+        tierCap: FREE_TIER_TOKEN_CAP,
+        maxUtilization: 0,
+        capsSummary: {}
+      };
+    }
 
-    if (capExceeded) {
-      console.warn(`[CAP] Free tier user ${userId} exceeded daily limit: ${dailyRequests}/${FREE_TIER_DAILY_REQUEST_LIMIT} requests, ${dailyTokens}/${FREE_TIER_DAILY_TOKEN_LIMIT} tokens.`);
+    const evaluation = evaluateFreeTierRequest({
+      usedTokens: usage.lifetimeTokens,
+      estimatedTokens,
+      cap: FREE_TIER_TOKEN_CAP
+    });
+    const warning = evaluation.blocked
+      ? 'free_lifetime_limit_reached'
+      : evaluation.percent >= 90
+        ? 'approaching_lifetime_limit'
+        : null;
+
+    if (evaluation.blocked) {
+      console.warn(
+        `[CAP] Free tier user ${userId} blocked at lifetime cap: ${usage.lifetimeTokens}/${FREE_TIER_TOKEN_CAP} tokens (estimate ${estimatedTokens}).`
+      );
     }
 
     return {
       tier: 'free',
-      targetModel: 'openrouter-free',
+      targetModel: FREE_TIER_MODEL_ID,
       isFreeTier: true,
-      capExceeded,
-      dailyRequests,
-      dailyTokens,
-      limitRequests: FREE_TIER_DAILY_REQUEST_LIMIT,
-      limitTokens: FREE_TIER_DAILY_TOKEN_LIMIT,
+      capExceeded: evaluation.blocked,
+      lifetimeTokens: usage.lifetimeTokens,
+      lifetimePromptTokens: usage.lifetimePromptTokens,
+      lifetimeCompletionTokens: usage.lifetimeCompletionTokens,
+      lifetimeCostUsd: usage.lifetimeCostUsd,
+      lifetimeCap: evaluation.cap,
+      lifetimeRemaining: evaluation.remaining,
+      lifetimePercent: evaluation.percent,
+      dailyRequests: 0,
+      dailyTokens: usage.lifetimeTokens,
+      limitRequests: 0,
+      limitTokens: evaluation.cap,
       allCapsExhausted: false,
-      warning: capExceeded ? 'free_daily_limit_reached' : null,
-      usagePercent: Number(((dailyRequests / FREE_TIER_DAILY_REQUEST_LIMIT) * 100).toFixed(1)),
-      currentUsage: dailyRequests,
-      tierCap: FREE_TIER_DAILY_REQUEST_LIMIT,
-      maxUtilization: dailyRequests / FREE_TIER_DAILY_REQUEST_LIMIT,
+      warning,
+      usagePercent: evaluation.percent,
+      currentUsage: usage.lifetimeTokens,
+      tierCap: evaluation.cap,
+      maxUtilization: evaluation.used / evaluation.cap,
       capsSummary: {
-        'openrouter-free': { used: dailyRequests, cap: FREE_TIER_DAILY_REQUEST_LIMIT, percent: Number(((dailyRequests / FREE_TIER_DAILY_REQUEST_LIMIT) * 100).toFixed(1)) },
-        'groq-free': { used: dailyRequests, cap: FREE_TIER_DAILY_REQUEST_LIMIT, percent: Number(((dailyRequests / FREE_TIER_DAILY_REQUEST_LIMIT) * 100).toFixed(1)) }
+        [FREE_TIER_MODEL_ID]: {
+          used: usage.lifetimeTokens,
+          cap: evaluation.cap,
+          percent: evaluation.percent
+        }
       }
     };
   }
@@ -500,12 +492,13 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
   const allCapsExhausted = !anyPaidRemaining;
   const overallPercent = Number(((flashUsed / flashCap) * 100).toFixed(1));
 
-  // Rule c: Paid tier, ALL paid caps exhausted -> force openrouter-free
+  // Rule c: Paid tier, ALL paid caps exhausted -> block. Never downgrade to a
+  // free provider or a different provider silently.
   if (allCapsExhausted) {
-    console.warn(`[CAP] User ${userId} (${tier}) exhausted all paid caps. Forcing free cloud tier (OpenRouter/Groq).`);
+    console.warn(`[CAP] User ${userId} (${tier}) exhausted all paid caps. Request will be blocked with 402.`);
     return {
       tier,
-      targetModel: 'openrouter-free',
+      targetModel: null,
       isFreeTier: false,
       allCapsExhausted: true,
       warning: 'all_caps_exhausted',
@@ -559,17 +552,6 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
     }
   }
 
-  // Fallback if no routine cloud model has quota:
-  if (!selectedModel) {
-    selectedModel = 'openrouter-free';
-  }
-
-  // Rule d: Hard guard against paid model leakage
-  if (!FREE_TIER_MODELS.has(selectedModel) && allCapsExhausted) {
-    selectedModel = 'openrouter-free';
-    console.error('[CAP] Paid model blocked at exhausted caps.');
-  }
-
   let warning = null;
   if (maxUtilization >= 1.0) {
     warning = 'hard_ceiling_reached';
@@ -592,176 +574,265 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 }
 
 // ---------------------------------------------------------------------------
-// HELPER: recordDailyFreeUsage
-// Records usage in usage_logs and updates subscriptions table daily counters
+// FREE TIER PROVIDER RESOLUTION (single provider, no fallbacks)
+// Priority: explicit metadata -> FREE_TIER_PROVIDER -> DeepInfra -> OpenRouter.
+// If no provider is configured we return 503 instead of trying another vendor.
 // ---------------------------------------------------------------------------
-async function recordDailyFreeUsage(userId, model, promptTokens, completionTokens) {
-  try {
-    const totalTokens = (promptTokens || 0) + (completionTokens || 0);
-    // 1. Insert into usage_logs
-    await supabase.from('usage_logs').insert({
-      user_id: userId,
-      model: model || 'openrouter-free',
-      prompt_tokens: promptTokens || 10,
-      completion_tokens: completionTokens || 10,
-      actual_cost: 0,
-      timestamp: new Date().toISOString()
-    });
+function resolveFreeTierProvider(metadata = {}) {
+  const explicit = (metadata.provider || '').trim().toLowerCase();
+  const preferred = explicit || FREE_TIER_PROVIDER;
 
-    // 2. Increment subscriptions table counts if columns exist
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const { data: sub } = await supabase
-      .from('subscriptions')
-      .select('daily_request_count, daily_token_count, daily_reset_date')
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (sub) {
-      const isToday = sub.daily_reset_date && String(sub.daily_reset_date).slice(0, 10) === todayStr;
-      const nextReq = isToday ? (Number(sub.daily_request_count) || 0) + 1 : 1;
-      const nextTok = isToday ? (Number(sub.daily_token_count) || 0) + totalTokens : totalTokens;
-
-      await supabase
-        .from('subscriptions')
-        .update({
-          daily_request_count: nextReq,
-          daily_token_count: nextTok,
-          daily_reset_date: todayStr
-        })
-        .eq('user_id', userId);
-    }
-  } catch (err) {
-    // Non-fatal if subscriptions columns have not been migrated yet
-    console.warn('[DAILY-USAGE] Non-fatal daily usage update note:', err.message);
+  if (preferred === 'openrouter' || metadata.mockEndpoint) {
+    const endpoint = metadata.mockEndpoint || metadata.endpoint || OPENROUTER_ENDPOINT;
+    const apiKey = metadata.apiKey || OPENROUTER_API_KEY;
+    if (!apiKey && !metadata.allowNoKey) return null;
+    return {
+      provider: 'openrouter',
+      endpoint,
+      apiKey,
+      model: metadata.model || OPENROUTER_PAID_MODEL
+    };
   }
+
+  if (preferred === 'deepinfra') {
+    if (!DEEPINFRA_API_KEY) return null;
+    return {
+      provider: 'deepinfra',
+      endpoint: metadata.endpoint || DEEPINFRA_ENDPOINT,
+      apiKey: metadata.apiKey || DEEPINFRA_API_KEY,
+      model: metadata.model || DEEPINFRA_MODEL_MAP[FREE_TIER_MODEL_ID]
+    };
+  }
+
+  if (DEEPINFRA_API_KEY) {
+    return {
+      provider: 'deepinfra',
+      endpoint: metadata.endpoint || DEEPINFRA_ENDPOINT,
+      apiKey: metadata.apiKey || DEEPINFRA_API_KEY,
+      model: metadata.model || DEEPINFRA_MODEL_MAP[FREE_TIER_MODEL_ID]
+    };
+  }
+
+  if (OPENROUTER_API_KEY) {
+    return {
+      provider: 'openrouter',
+      endpoint: metadata.endpoint || OPENROUTER_ENDPOINT,
+      apiKey: metadata.apiKey || OPENROUTER_API_KEY,
+      model: metadata.model || OPENROUTER_PAID_MODEL
+    };
+  }
+
+  return null;
 }
 
-// ---------------------------------------------------------------------------
-// STACKED CLOUD FREE TIER DISPATCH
-// Attempt 1: OpenRouter Free API (rotating pool of up to 20 keys)
-// Catch 429/503: Immediately failover to Attempt 2: Groq Free API (llama-3.1-8b-instant)
-// Catch Final Failure: Return 503 with exact upgrade message
-// Strictly guarantees NEVER falling back to a paid model.
-// ---------------------------------------------------------------------------
-async function dispatchFreeTierChat(messages, metadata = {}) {
-  const isMock429 = Boolean(metadata.mockOpenRouter429);
+function buildFreeTierRequestBody(messages, metadata, provider, stream) {
+  const maxTokens = metadata.max_tokens != null
+    ? Math.min(Number(metadata.max_tokens) || 4096, 4096)
+    : 4096;
 
-  // ATTEMPT 1: OpenRouter Free with API Key Rotation & Retry (unless mock 429 requested)
-  if (!isMock429) {
-    const endpoint = metadata.mockEndpoint || process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
-    const keys = loadOpenRouterKeys();
-    const maxAttempts = Math.max(1, keys.length);
-
-    const extraParams = {
-      ...(metadata.tools ? { tools: metadata.tools } : {}),
-      ...(metadata.tool_choice ? { tool_choice: metadata.tool_choice } : {}),
-      ...(metadata.temperature != null ? { temperature: metadata.temperature } : {}),
-      ...(metadata.max_tokens != null ? { max_tokens: Math.min(Number(metadata.max_tokens) || 4096, 4096) } : { max_tokens: 4096 })
-    };
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const apiKey = getApiKey();
-      const maskedKey = apiKey ? `${apiKey.slice(0, 10)}...${apiKey.slice(-4)}` : 'none';
-
-      try {
-        const orResponse = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'HTTP-Referer': 'https://albion.dev',
-            'X-Title': 'Albion Editor'
-          },
-          body: JSON.stringify({
-            model: OPENROUTER_FREE_MODEL,
-            messages,
-            ...extraParams
-          })
-        });
-
-        if (orResponse.status === 429 || orResponse.status === 503) {
-          const errText = await orResponse.text().catch(() => '');
-          console.warn(`[KEY-ROTATION] OpenRouter returned HTTP ${orResponse.status} on key ${maskedKey}: ${errText}. Retrying with next key...`);
-          rotateApiKey();
-          continue;
-        }
-
-        if (!orResponse.ok) {
-          const errText = await orResponse.text().catch(() => '');
-          console.warn(`[FREE-TIER] OpenRouter returned HTTP ${orResponse.status}: ${errText}. Attempting Groq fallback...`);
-          break; // Other non-rate-limit errors fall back to Groq
-        }
-
-        const data = await orResponse.json();
-        rotateApiKey(); // Balance load for next request
-        return { success: true, model: 'openrouter-free', data };
-      } catch (err) {
-        console.warn(`[KEY-ROTATION] OpenRouter request error with key ${maskedKey}: ${err.message}. Retrying with next key...`);
-        rotateApiKey();
-      }
-    }
-  } else {
-    console.log('[MOCK-429] OpenRouter 429 simulated via test flag. Seamlessly falling back to Groq...');
-  }
-
-  // ATTEMPT 2: Groq Free Fallback
-  const extraParams = {
+  return {
+    model: provider.model,
+    messages,
     ...(metadata.tools ? { tools: metadata.tools } : {}),
     ...(metadata.tool_choice ? { tool_choice: metadata.tool_choice } : {}),
     ...(metadata.temperature != null ? { temperature: metadata.temperature } : {}),
-    ...(metadata.max_tokens != null ? { max_tokens: Math.min(Number(metadata.max_tokens) || 4096, 4096) } : { max_tokens: 4096 })
+    max_tokens: maxTokens,
+    ...(stream ? { stream: true, stream_options: { include_usage: true } } : {})
   };
+}
 
-  if (GROQ_API_KEY) {
-    try {
-      const groqResponse = await fetch(GROQ_ENDPOINT, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_API_KEY}`
-        },
-        body: JSON.stringify({
-          model: GROQ_FREE_MODEL,
-          messages,
-          ...extraParams
-        })
-      });
+function freeTierProviderHeaders(provider) {
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${provider.apiKey}`,
+    ...(provider.provider === 'openrouter'
+      ? { 'HTTP-Referer': 'https://albion.dev', 'X-Title': 'Albion Editor' }
+      : {})
+  };
+}
 
-      if (groqResponse.ok) {
-        const data = await groqResponse.json();
-        return { success: true, model: 'groq-free', data };
-      }
-
-      const errText = await groqResponse.text().catch(() => '');
-      console.error(`[FREE-TIER] Groq returned HTTP ${groqResponse.status}: ${errText}.`);
-    } catch (err) {
-      console.error(`[FREE-TIER] Groq request failed: ${err.message}.`);
-    }
-  } else if (isMock429) {
-    // Graceful test mock response for Groq fallback verification
-    return {
-      success: true,
-      model: 'groq-free',
-      data: {
-        id: 'chatcmpl-mock-groq-' + Date.now(),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: GROQ_FREE_MODEL,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: 'Groq Free Fallback active (llama-3.1-8b-instant). Rate limit resilience verified.' },
-          finish_reason: 'stop'
-        }],
-        usage: { prompt_tokens: 25, completion_tokens: 15, total_tokens: 40 }
-      }
-    };
-  }
-
+function freeTierUnavailable(provider) {
   return {
     success: false,
     status: 503,
-    error: DAILY_FREE_LIMIT_MESSAGE
+    provider: provider ? provider.provider : null,
+    error: provider
+      ? 'Free tier provider is temporarily unavailable. Please try again shortly.'
+      : 'No free tier AI provider is configured. Please contact support.'
   };
+}
+
+async function dispatchFreeTierChat(messages, metadata = {}) {
+  const provider = resolveFreeTierProvider(metadata);
+  if (!provider) {
+    console.error('[FREE-TIER] No provider configured (DEEPINFRA_API_KEY / OPENROUTER_API_KEY missing).');
+    return freeTierUnavailable(null);
+  }
+
+  const fetchImpl = metadata.fetchImpl || fetch;
+  try {
+    const response = await fetchImpl(provider.endpoint, {
+      method: 'POST',
+      headers: freeTierProviderHeaders(provider),
+      body: JSON.stringify(buildFreeTierRequestBody(messages, metadata, provider, false))
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(
+        `[FREE-TIER] ${provider.provider} returned HTTP ${response.status}: ${errText}. No fallback configured.`
+      );
+      return freeTierUnavailable(provider);
+    }
+
+    const data = await response.json();
+    return { success: true, model: FREE_TIER_MODEL_ID, provider: provider.provider, data };
+  } catch (err) {
+    console.error(`[FREE-TIER] ${provider.provider} request failed: ${err.message}. No fallback configured.`);
+    return freeTierUnavailable(provider);
+  }
+}
+
+async function dispatchFreeTierStream(messages, metadata = {}) {
+  const provider = resolveFreeTierProvider(metadata);
+  if (!provider) {
+    console.error('[FREE-TIER] No provider configured (DEEPINFRA_API_KEY / OPENROUTER_API_KEY missing).');
+    return freeTierUnavailable(null);
+  }
+
+  const fetchImpl = metadata.fetchImpl || fetch;
+  try {
+    const response = await fetchImpl(provider.endpoint, {
+      method: 'POST',
+      headers: freeTierProviderHeaders(provider),
+      body: JSON.stringify(buildFreeTierRequestBody(messages, metadata, provider, true))
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(
+        `[FREE-TIER] ${provider.provider} stream returned HTTP ${response.status}: ${errText}. No fallback configured.`
+      );
+      return freeTierUnavailable(provider);
+    }
+
+    return { success: true, model: FREE_TIER_MODEL_ID, provider: provider.provider, response };
+  } catch (err) {
+    console.error(`[FREE-TIER] ${provider.provider} stream failed: ${err.message}. No fallback configured.`);
+    return freeTierUnavailable(provider);
+  }
+}
+
+async function* iterateResponseBody(response) {
+  const body = response.body;
+  if (!body) return;
+  if (typeof body[Symbol.asyncIterator] === 'function') {
+    for await (const chunk of body) {
+      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    }
+    return;
+  }
+  const reader = body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) yield Buffer.from(value);
+  }
+}
+
+/**
+ * Streams provider SSE to the client while extracting token usage from the
+ * final `usage` chunk. The callback is invoked exactly once, even if the
+ * connection drops, so lifetime usage is never lost.
+ */
+async function pipeSseWithUsage(providerResponse, res, fallbackPromptTokens, onComplete) {
+  let buffer = '';
+  let completionText = '';
+  let usage = null;
+  let finalized = false;
+
+  const handleLine = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    try {
+      const chunk = JSON.parse(payload);
+      const chunkUsage = extractUsageFromSseChunk(chunk);
+      if (chunkUsage) usage = chunkUsage;
+      completionText += extractCompletionTextFromSseChunk(chunk);
+    } catch {
+      /* Ignore keep-alive or malformed SSE lines. */
+    }
+  };
+
+  const finalize = async () => {
+    if (finalized) return;
+    finalized = true;
+    const promptTokens = usage ? usage.promptTokens : fallbackPromptTokens;
+    const completionTokens = usage
+      ? usage.completionTokens
+      : Math.max(1, Math.ceil(completionText.length / 4));
+    try {
+      await onComplete({ promptTokens, completionTokens });
+    } catch (err) {
+      console.error('[FREE-TIER] Failed to finalize streamed usage:', err.message);
+    }
+  };
+
+  try {
+    for await (const chunk of iterateResponseBody(providerResponse)) {
+      buffer += chunk.toString('utf8');
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
+        buffer = buffer.slice(newlineIndex + 1);
+        handleLine(line);
+      }
+      if (!res.writableEnded && !res.destroyed) {
+        if (!res.write(chunk)) {
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+      }
+    }
+    if (buffer) handleLine(buffer);
+  } finally {
+    await finalize();
+    if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
+  }
+}
+
+async function recordFreeTierUsage(userId, { promptTokens, completionTokens, reservedTokens, cap, sessionId }) {
+  const prompt = Math.max(0, Math.round(Number(promptTokens) || 0));
+  const completion = Math.max(0, Math.round(Number(completionTokens) || 0));
+  const costUsd = computeTokenCost(prompt, completion);
+
+  let commitResult = null;
+  try {
+    commitResult = await freeTierAccounting.commit(
+      userId,
+      reservedTokens,
+      prompt,
+      completion,
+      costUsd,
+      cap
+    );
+  } catch (err) {
+    // Fail loud in logs, but do not discard a response the user already received.
+    console.error(`[FREE-TIER] CRITICAL: could not commit lifetime usage for ${userId}: ${err.message}`);
+  }
+
+  await freeTierAccounting.recordUsageLog(userId, {
+    model: FREE_TIER_MODEL_ID,
+    promptTokens: prompt,
+    completionTokens: completion,
+    costUsd,
+    sessionId
+  });
+
+  return { promptTokens: prompt, completionTokens: completion, costUsd, commitResult };
 }
 
 // ---------------------------------------------------------------------------
@@ -789,14 +860,16 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
     return false;
   });
 
+  let isFreeTierRequest = false;
   try {
     // STEP 1: Pre-request cap & routing check — BEFORE any provider call
-    const estimatedTokenCount = estimated_tokens || 1000;
+    const estimatedTokenCount = Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages));
     const capResult = await checkCapBeforeRoute(userId, {
       forceModel: forceModelHeader,
       hasImages,
       estimatedTokens: estimatedTokenCount
     });
+    isFreeTierRequest = Boolean(capResult.isFreeTier);
 
     const targetModel = capResult.targetModel;
 
@@ -840,59 +913,117 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
     }
 
     // Set custom transparency & fuel gauge response headers
-    res.setHeader('X-Albion-Usage-Percent', capResult.usagePercent.toString());
-    res.setHeader('X-Albion-Active-Model', targetModel);
+    res.setHeader('X-Albion-Usage-Percent', Number(capResult.usagePercent || 0).toString());
+    res.setHeader('X-Albion-Active-Model', targetModel || 'locked');
     res.setHeader('X-Albion-Tier', capResult.tier);
-    res.setHeader('X-Albion-Current-Tokens', capResult.currentUsage.toString());
-    res.setHeader('X-Albion-Cap-Tokens', capResult.tierCap.toString());
+    res.setHeader('X-Albion-Current-Tokens', String(capResult.currentUsage || 0));
+    res.setHeader('X-Albion-Cap-Tokens', String(capResult.tierCap || 0));
     res.setHeader('X-Albion-Caps-Summary', JSON.stringify(capResult.capsSummary || {}));
+    if (capResult.isFreeTier) {
+      res.setHeader('X-Albion-Free-Tier-Tokens-Used', String(capResult.lifetimeTokens || 0));
+      res.setHeader('X-Albion-Free-Tier-Token-Cap', String(capResult.lifetimeCap || FREE_TIER_TOKEN_CAP));
+      res.setHeader('X-Albion-Free-Tier-Remaining', String(capResult.lifetimeRemaining || 0));
+    }
 
     if (capResult.warning) {
       res.setHeader('X-Albion-Usage-Warning', capResult.warning);
     }
 
-    // STEP 4b: Pre-flight Free Tier Cap Check
-    if (capResult.isFreeTier && capResult.capExceeded) {
-      console.warn(`[CHAT] PRE-FLIGHT BLOCK: Free tier daily limit reached for user ${userId} (${capResult.dailyRequests}/${FREE_TIER_DAILY_REQUEST_LIMIT} requests). Request blocked before provider.`);
-      res.setHeader('X-Albion-Cap-Exceeded', 'true');
-      res.setHeader('X-Albion-Usage-Warning', 'free_daily_limit_reached');
-      res.setHeader('X-Albion-Daily-Requests', capResult.dailyRequests.toString());
-      res.setHeader('X-Albion-Daily-Tokens', capResult.dailyTokens.toString());
-      return res.status(429).json({
-        error: "You've reached your daily free limit (50 messages). Upgrade to Starter ($8/mo) for unlimited fast requests, or your limit resets at midnight.",
-        cap_exceeded: true,
-        daily_requests: capResult.dailyRequests,
-        daily_tokens: capResult.dailyTokens,
-        limit_requests: FREE_TIER_DAILY_REQUEST_LIMIT,
-        limit_tokens: FREE_TIER_DAILY_TOKEN_LIMIT,
-        reset_time: "00:00 UTC"
+    if (capResult.accountingError) {
+      return res.status(503).json({
+        error: capResult.error || 'Free tier accounting is temporarily unavailable.',
+        accounting_error: true
       });
     }
 
-    // STEP 5: Route request
-    // Free Tier OR All Caps Exhausted: Dispatch to Stacked Cloud Free Tier (OpenRouter -> Groq)
-    // NEVER call LiteLLM or paid DeepInfra/Together models when caps are exhausted.
-    if (capResult.isFreeTier || capResult.allCapsExhausted || FREE_TIER_MODELS.has(targetModel)) {
-      const freeResult = await dispatchFreeTierChat(orderedMessages, {
-        userId,
-        project_path,
-        mockEndpoint: req.headers['x-albion-mock-provider-url'],
-        mockOpenRouter429: req.headers['x-albion-mock-openrouter-429'] === 'true' || req.query.mock_openrouter_429 === 'true'
+    // STEP 4b: Pre-flight lifetime cap check (200,000 tokens, never resets)
+    if (capResult.isFreeTier && capResult.capExceeded) {
+      console.warn(`[CHAT] PRE-FLIGHT BLOCK: Free tier lifetime limit reached for user ${userId} (${capResult.lifetimeTokens}/${capResult.lifetimeCap} tokens).`);
+      res.setHeader('X-Albion-Cap-Exceeded', 'true');
+      res.setHeader('X-Albion-Usage-Warning', 'free_lifetime_limit_reached');
+      return res.status(402).json({
+        error: FREE_TIER_LIMIT_MESSAGE,
+        cap_exceeded: true,
+        lifetime_tokens: capResult.lifetimeTokens,
+        lifetime_cap: capResult.lifetimeCap,
+        lifetime_remaining: 0,
+        tier: 'free',
+        code: 'free_tier_lifetime_limit_reached'
       });
+    }
 
-      if (!freeResult.success) {
-        return res.status(503).json({
-          error: freeResult.error || DAILY_FREE_LIMIT_MESSAGE
+    // STEP 5: Route request.
+    // Free tier uses exactly one provider. No Groq, no cross-provider fallback.
+    if (capResult.isFreeTier) {
+      let reservation;
+      try {
+        reservation = await freeTierAccounting.reserve(userId, estimatedTokenCount, capResult.lifetimeCap);
+      } catch (err) {
+        console.error(`[CHAT] Free tier reservation failed for ${userId}:`, err.message);
+        return res.status(503).json({ error: 'Free tier accounting is temporarily unavailable. Please try again shortly.' });
+      }
+
+      if (!reservation.allowed) {
+        res.setHeader('X-Albion-Cap-Exceeded', 'true');
+        return res.status(402).json({
+          error: FREE_TIER_LIMIT_MESSAGE,
+          cap_exceeded: true,
+          lifetime_tokens: reservation.used,
+          lifetime_cap: reservation.cap || capResult.lifetimeCap,
+          lifetime_remaining: 0,
+          tier: 'free',
+          code: 'free_tier_lifetime_limit_reached'
         });
       }
 
-      // Record free tier usage
-      await recordDailyFreeUsage(userId, freeResult.model, freeResult.data?.usage?.prompt_tokens, freeResult.data?.usage?.completion_tokens);
+      const freeResult = await dispatchFreeTierChat(orderedMessages, {
+        userId,
+        project_path,
+        temperature: req.body.temperature,
+        max_tokens: req.body.max_completion_tokens || req.body.max_tokens,
+        mockEndpoint: req.headers['x-albion-mock-provider-url'],
+        provider: req.headers['x-albion-mock-provider'],
+        fetchImpl: req.app.locals.freeTierFetchImpl
+      });
 
-      // Update active model header with the specific free model that answered
-      res.setHeader('X-Albion-Active-Model', freeResult.model);
+      if (!freeResult.success) {
+        await freeTierAccounting.release(userId, reservation.reserved);
+        return res.status(503).json({
+          error: freeResult.error,
+          provider: freeResult.provider || null
+        });
+      }
 
+      const freeUsage = (freeResult.data && freeResult.data.usage) || {};
+      const recorded = await recordFreeTierUsage(userId, {
+        promptTokens: freeUsage.prompt_tokens || estimatedMessagesTokens(orderedMessages),
+        completionTokens:
+          freeUsage.completion_tokens || estimateTextTokens(JSON.stringify(freeResult.data || {})),
+        reservedTokens: reservation.reserved,
+        cap: capResult.lifetimeCap,
+        sessionId: session_id
+      });
+
+      const usedAfter = recorded.commitResult ? recorded.commitResult.used : reservation.used;
+      res.setHeader('X-Albion-Active-Model', FREE_TIER_MODEL_ID);
+      res.setHeader('X-Albion-Current-Tokens', String(usedAfter));
+      res.setHeader(
+        'X-Albion-Usage-Percent',
+        Number(((usedAfter / capResult.lifetimeCap) * 100).toFixed(2)).toString()
+      );
+      res.setHeader('X-Albion-Free-Tier-Tokens-Used', String(usedAfter));
+      res.setHeader('X-Albion-Free-Tier-Remaining', String(Math.max(0, capResult.lifetimeCap - usedAfter)));
+      res.setHeader('X-Albion-Free-Tier-Cost-Usd', recorded.costUsd.toFixed(8));
       return res.json(freeResult.data);
+    }
+
+    // Paid tier: caps exhausted -> 402. Never downgrade to a free provider.
+    if (capResult.allCapsExhausted || !targetModel) {
+      return res.status(402).json({
+        error: 'Your plan token cap is exhausted. Please top up or upgrade to continue.',
+        cap_exceeded: true,
+        tier: capResult.tier
+      });
     }
 
     // Paid Cloud Routing: Primary via DeepInfra Native OpenAI-compatible API
@@ -913,19 +1044,10 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
         })
       });
 
-      // Wallet unfunded (402) - Gracefully fail over to Stacked Free Tier
+      // Wallet unfunded (402) -> 503, no fallback to another provider.
       if (providerResponse.status === 402) {
-        console.warn(`[PAID-ROUTER] DeepInfra returned 402 (Wallet requires top-up) for user ${userId}. Gracefully falling back to Stacked Free Tier.`);
-        res.setHeader('X-Albion-Paid-Notice', 'DeepInfra wallet top-up needed; free tier fallback active');
-        const freeResult = await dispatchFreeTierChat(orderedMessages, {
-          userId,
-          project_path,
-          mockEndpoint: req.headers['x-albion-mock-provider-url']
-        });
-        if (freeResult.success) {
-          res.setHeader('X-Albion-Active-Model', freeResult.model);
-          return res.json(freeResult.data);
-        }
+        console.error(`[PAID-ROUTER] DeepInfra returned 402 (wallet top-up required) for user ${userId}. No fallback configured.`);
+        return res.status(503).json({ error: 'AI provider is temporarily unavailable. Please try again shortly.' });
       }
     } else {
       // Secondary fallback to LiteLLM if configured
@@ -961,21 +1083,19 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
     const data = await providerResponse.json();
 
     // STEP 7: Synchronously log usage BEFORE responding to client (paid models only)
-    if (!FREE_TIER_MODELS.has(targetModel)) {
-      const { error: logError } = await supabase.from('usage_logs').insert({
-        user_id: userId,
-        model: targetModel,
-        prompt_tokens: data.usage?.prompt_tokens || 0,
-        completion_tokens: data.usage?.completion_tokens || 0,
-        actual_cost: data.metadata?.cost || 0,
-        session_id: session_id || null,
-        timestamp: new Date().toISOString()
-      });
+    const { error: logError } = await supabase.from('usage_logs').insert({
+      user_id: userId,
+      model: targetModel,
+      prompt_tokens: data.usage?.prompt_tokens || 0,
+      completion_tokens: data.usage?.completion_tokens || 0,
+      actual_cost: data.metadata?.cost || 0,
+      session_id: session_id || null,
+      timestamp: new Date().toISOString()
+    });
 
-      if (logError) {
-        // Log the error but don't fail the request — usage is already consumed
-        console.error(`[USAGE] Failed to log usage for user ${userId}:`, logError.message);
-      }
+    if (logError) {
+      // Log the error but don't fail the request — usage is already consumed
+      console.error(`[USAGE] Failed to log usage for user ${userId}:`, logError.message);
     }
 
     // STEP 8: Return provider response to Cline
@@ -991,9 +1111,9 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
     console.error(`[CHAT] Error for user ${userId}:`, err.message);
 
-    if (typeof targetModel !== 'undefined' && FREE_TIER_MODELS.has(targetModel)) {
+    if (isFreeTierRequest) {
       return res.status(503).json({
-        error: DAILY_FREE_LIMIT_MESSAGE
+        error: 'Free tier provider is temporarily unavailable. Please try again shortly.'
       });
     }
 
@@ -1037,15 +1157,17 @@ async function openAIChatCompletionsHandler(req, res) {
   });
 
   let targetModel;
+  let isFreeTierRequest = false;
   try {
     // STEP 1: Cap & routing check — identical to /chat
-    const estimatedTokenCount = estimated_tokens || 1000;
+    const estimatedTokenCount = Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages));
     const capResult = await checkCapBeforeRoute(userId, {
       forceModel: forceModelHeader,
       hasImages,
       estimatedTokens: estimatedTokenCount
     });
     targetModel = capResult.targetModel;
+    isFreeTierRequest = Boolean(capResult.isFreeTier);
 
     // STEP 2: Project memory injection (same as /chat)
     let memoryBlock = '<project_memory></project_memory>';
@@ -1075,194 +1197,66 @@ async function openAIChatCompletionsHandler(req, res) {
     }
 
     // STEP 4: Transparency headers (same set as /chat)
-    res.setHeader('X-Albion-Usage-Percent', capResult.usagePercent.toString());
-    res.setHeader('X-Albion-Active-Model', targetModel);
+    res.setHeader('X-Albion-Usage-Percent', Number(capResult.usagePercent || 0).toString());
+    res.setHeader('X-Albion-Active-Model', targetModel || 'locked');
     res.setHeader('X-Albion-Tier', capResult.tier);
-    res.setHeader('X-Albion-Current-Tokens', capResult.currentUsage.toString());
-    res.setHeader('X-Albion-Cap-Tokens', capResult.tierCap.toString());
+    res.setHeader('X-Albion-Current-Tokens', String(capResult.currentUsage || 0));
+    res.setHeader('X-Albion-Cap-Tokens', String(capResult.tierCap || 0));
     res.setHeader('X-Albion-Caps-Summary', JSON.stringify(capResult.capsSummary || {}));
+    if (capResult.isFreeTier) {
+      res.setHeader('X-Albion-Free-Tier-Tokens-Used', String(capResult.lifetimeTokens || 0));
+      res.setHeader('X-Albion-Free-Tier-Token-Cap', String(capResult.lifetimeCap || FREE_TIER_TOKEN_CAP));
+      res.setHeader('X-Albion-Free-Tier-Remaining', String(capResult.lifetimeRemaining || 0));
+    }
     if (capResult.warning) res.setHeader('X-Albion-Usage-Warning', capResult.warning);
 
-    // STEP 4b: Pre-flight Free Tier Cap Check
-    if (capResult.isFreeTier && capResult.capExceeded) {
-      console.warn(`[OPENAI-COMPLETIONS] PRE-FLIGHT BLOCK: Free tier daily limit reached for user ${userId} (${capResult.dailyRequests}/${FREE_TIER_DAILY_REQUEST_LIMIT} requests). Request blocked before provider.`);
-      res.setHeader('X-Albion-Cap-Exceeded', 'true');
-      res.setHeader('X-Albion-Usage-Warning', 'free_daily_limit_reached');
-      res.setHeader('X-Albion-Daily-Requests', capResult.dailyRequests.toString());
-      res.setHeader('X-Albion-Daily-Tokens', capResult.dailyTokens.toString());
-      return res.status(429).json({
-        error: "You've reached your daily free limit (50 messages). Upgrade to Starter ($8/mo) for unlimited fast requests, or your limit resets at midnight.",
-        cap_exceeded: true,
-        daily_requests: capResult.dailyRequests,
-        daily_tokens: capResult.dailyTokens,
-        limit_requests: FREE_TIER_DAILY_REQUEST_LIMIT,
-        limit_tokens: FREE_TIER_DAILY_TOKEN_LIMIT,
-        reset_time: "00:00 UTC"
+    if (capResult.accountingError) {
+      return res.status(503).json({
+        error: capResult.error || 'Free tier accounting is temporarily unavailable.',
+        accounting_error: true
       });
     }
 
-    // STEP 5a: Free tier / caps exhausted → Stacked free-tier dispatch
-    if (capResult.isFreeTier || capResult.allCapsExhausted || FREE_TIER_MODELS.has(targetModel)) {
-      const isMock429 = req.headers['x-albion-mock-openrouter-429'] === 'true' || req.query.mock_openrouter_429 === 'true';
+    // STEP 4b: Pre-flight lifetime cap check (200,000 tokens, never resets)
+    if (capResult.isFreeTier && capResult.capExceeded) {
+      console.warn(`[OPENAI-COMPLETIONS] PRE-FLIGHT BLOCK: Free tier lifetime limit reached for user ${userId} (${capResult.lifetimeTokens}/${capResult.lifetimeCap} tokens).`);
+      res.setHeader('X-Albion-Cap-Exceeded', 'true');
+      res.setHeader('X-Albion-Usage-Warning', 'free_lifetime_limit_reached');
+      return res.status(402).json({
+        error: FREE_TIER_LIMIT_MESSAGE,
+        cap_exceeded: true,
+        lifetime_tokens: capResult.lifetimeTokens,
+        lifetime_cap: capResult.lifetimeCap,
+        lifetime_remaining: 0,
+        tier: 'free',
+        code: 'free_tier_lifetime_limit_reached'
+      });
+    }
 
-      if (stream) {
-        // SSE streaming: pipe directly from free provider; shape is real OpenAI SSE chunks
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-
-        let requestedMax = req.body.max_tokens || req.body.max_completion_tokens;
-        if (requestedMax != null) {
-          requestedMax = Math.min(Number(requestedMax) || 4096, 4096);
-        } else {
-          requestedMax = 4096;
-        }
-
-        const commonForwardParams = {
-          ...(req.body.tools ? { tools: req.body.tools } : {}),
-          ...(req.body.tool_choice ? { tool_choice: req.body.tool_choice } : {}),
-          ...(req.body.temperature != null ? { temperature: req.body.temperature } : {}),
-          max_tokens: requestedMax
-        };
-
-        // Attempt 1: OpenRouter streaming with API Key Rotation & Retry (unless mock 429 requested)
-        let streamed = false;
-        if (!isMock429) {
-          const keys = loadOpenRouterKeys();
-          const maxAttempts = Math.max(1, keys.length);
-          const orEndpoint = req.headers['x-albion-mock-provider-url'] || process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
-
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const apiKey = getApiKey();
-            const maskedKey = apiKey ? `${apiKey.slice(0, 10)}...${apiKey.slice(-4)}` : 'none';
-
-            try {
-              const orRes = await fetch(orEndpoint, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${apiKey}`,
-                  'HTTP-Referer': 'https://albion.dev',
-                  'X-Title': 'Albion Editor'
-                },
-                body: JSON.stringify({
-                  model: OPENROUTER_FREE_MODEL,
-                  messages: orderedMessages,
-                  stream: true,
-                  ...commonForwardParams
-                })
-              });
-
-              if (orRes.status === 429 || orRes.status === 503) {
-                const errText = await orRes.text().catch(() => '');
-                console.warn(`[KEY-ROTATION] OpenRouter stream HTTP ${orRes.status} on key ${maskedKey}: ${errText}. Retrying with next key...`);
-                rotateApiKey();
-                continue;
-              }
-
-              if (orRes.ok) {
-                res.setHeader('X-Albion-Active-Model', 'openrouter-free');
-                pipeResponseBody(orRes, res);
-                streamed = true;
-                rotateApiKey(); // Balance load for next request
-                break;
-              } else {
-                const errText = await orRes.text().catch(() => '');
-                console.warn(`[ALIAS-FREE] OpenRouter stream HTTP ${orRes.status}: ${errText}. Trying Groq...`);
-                break;
-              }
-            } catch (err) {
-              console.warn(`[KEY-ROTATION] OpenRouter stream error on key ${maskedKey}: ${err.message}. Retrying with next key...`);
-              rotateApiKey();
-            }
-          }
-        } else {
-          console.log('[MOCK-429] Mocking OpenRouter 429 rate limit. Directly falling back to Groq stream...');
-        }
-
-        if (!streamed && isMock429 && !GROQ_API_KEY) {
-          res.setHeader('X-Albion-Active-Model', 'groq-free');
-          res.write(`data: ${JSON.stringify({
-            id: 'chatcmpl-mock-groq-' + Date.now(),
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: GROQ_FREE_MODEL,
-            choices: [{
-              index: 0,
-              delta: { content: 'Groq Free Fallback active (llama-3.1-8b-instant). Rate limit resilience verified.' },
-              finish_reason: null
-            }]
-          })}\n\n`);
-          res.write(`data: ${JSON.stringify({
-            id: 'chatcmpl-mock-groq-' + Date.now(),
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: GROQ_FREE_MODEL,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: 'stop'
-            }]
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-          streamed = true;
-        } else if (!streamed && GROQ_API_KEY) {
-          // Attempt 2: Groq streaming fallback
-          try {
-            const groqRes = await fetch(GROQ_ENDPOINT, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${GROQ_API_KEY}`
-              },
-              body: JSON.stringify({
-                model: GROQ_FREE_MODEL,
-                messages: orderedMessages,
-                stream: true,
-                ...commonForwardParams
-              })
-            });
-
-            if (groqRes.ok) {
-              res.setHeader('X-Albion-Active-Model', 'groq-free');
-              pipeResponseBody(groqRes, res);
-              streamed = true;
-            } else {
-              const errText = await groqRes.text().catch(() => '');
-              console.error(`[ALIAS-FREE] Groq stream HTTP ${groqRes.status}: ${errText}. Both exhausted.`);
-            }
-          } catch (err) {
-            console.error(`[ALIAS-FREE] Groq stream error: ${err.message}. Both exhausted.`);
-          }
-        }
-
-        if (!streamed) {
-          // Both providers failed — emit user-facing text chunk so chat displays the notice clearly
-          res.write(`data: ${JSON.stringify({
-            id: 'chatcmpl-free-err',
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: 'free-tier',
-            choices: [{
-              index: 0,
-              delta: { content: 'Free tier rate limit reached. Retrying or upgrading provides instant priority access.' },
-              finish_reason: 'stop'
-            }]
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }
-        // Log usage for free tier completion and increment daily counters
-        const activeMod = streamed ? (res.getHeader('X-Albion-Active-Model') || 'openrouter-free') : 'free-model';
-        const promptToks = orderedMessages.reduce((acc, m) => acc + (typeof m.content === 'string' ? m.content.length : 10), 0);
-        await recordDailyFreeUsage(userId, activeMod, promptToks, 15);
-        return;
+    // STEP 5a: Free tier -> exactly one provider. No Groq, no fallback.
+    if (capResult.isFreeTier) {
+      let reservation;
+      try {
+        reservation = await freeTierAccounting.reserve(userId, estimatedTokenCount, capResult.lifetimeCap);
+      } catch (err) {
+        console.error(`[ALIAS] Free tier reservation failed for ${userId}:`, err.message);
+        return res.status(503).json({ error: 'Free tier accounting is temporarily unavailable. Please try again shortly.' });
       }
 
-      // Non-streaming free tier: use existing dispatchFreeTierChat helper
-      const freeResult = await dispatchFreeTierChat(orderedMessages, {
+      if (!reservation.allowed) {
+        res.setHeader('X-Albion-Cap-Exceeded', 'true');
+        return res.status(402).json({
+          error: FREE_TIER_LIMIT_MESSAGE,
+          cap_exceeded: true,
+          lifetime_tokens: reservation.used,
+          lifetime_cap: reservation.cap || capResult.lifetimeCap,
+          lifetime_remaining: 0,
+          tier: 'free',
+          code: 'free_tier_lifetime_limit_reached'
+        });
+      }
+
+      const freeMetadata = {
         userId,
         project_path,
         tools: req.body.tools,
@@ -1270,18 +1264,91 @@ async function openAIChatCompletionsHandler(req, res) {
         temperature: req.body.temperature,
         max_tokens: req.body.max_completion_tokens || req.body.max_tokens,
         mockEndpoint: req.headers['x-albion-mock-provider-url'],
-        mockOpenRouter429: isMock429
-      });
-      if (!freeResult.success) {
-        return res.status(503).json({ error: freeResult.error || DAILY_FREE_LIMIT_MESSAGE });
+        provider: req.headers['x-albion-mock-provider'],
+        fetchImpl: req.app.locals.freeTierFetchImpl
+      };
+
+      if (stream) {
+        const streamResult = await dispatchFreeTierStream(orderedMessages, freeMetadata);
+        if (!streamResult.success) {
+          await freeTierAccounting.release(userId, reservation.reserved);
+          return res.status(503).json({
+            error: streamResult.error,
+            provider: streamResult.provider || null
+          });
+        }
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('X-Albion-Active-Model', FREE_TIER_MODEL_ID);
+
+        const fallbackPromptTokens = estimateMessagesTokens(orderedMessages);
+        try {
+          await pipeSseWithUsage(
+            streamResult.response,
+            res,
+            fallbackPromptTokens,
+            async ({ promptTokens, completionTokens }) => {
+              await recordFreeTierUsage(userId, {
+                promptTokens,
+                completionTokens,
+                reservedTokens: reservation.reserved,
+                cap: capResult.lifetimeCap,
+                sessionId: session_id
+              });
+            }
+          );
+        } catch (err) {
+          console.error(`[ALIAS] Free tier stream failed for ${userId}:`, err.message);
+          if (!res.headersSent) {
+            await freeTierAccounting.release(userId, reservation.reserved);
+            return res.status(503).json({ error: 'Free tier stream failed. Please try again shortly.' });
+          }
+        }
+        return;
       }
 
-      const pToks = freeResult.data?.usage?.prompt_tokens || orderedMessages.reduce((acc, m) => acc + (typeof m.content === 'string' ? m.content.length : 10), 0);
-      const cToks = freeResult.data?.usage?.completion_tokens || 10;
-      await recordDailyFreeUsage(userId, freeResult.model || 'openrouter-free', pToks, cToks);
+      const freeResult = await dispatchFreeTierChat(orderedMessages, freeMetadata);
+      if (!freeResult.success) {
+        await freeTierAccounting.release(userId, reservation.reserved);
+        return res.status(503).json({
+          error: freeResult.error,
+          provider: freeResult.provider || null
+        });
+      }
 
-      res.setHeader('X-Albion-Active-Model', freeResult.model);
+      const freeUsage = (freeResult.data && freeResult.data.usage) || {};
+      const recorded = await recordFreeTierUsage(userId, {
+        promptTokens: freeUsage.prompt_tokens || estimateMessagesTokens(orderedMessages),
+        completionTokens:
+          freeUsage.completion_tokens || estimateTextTokens(JSON.stringify(freeResult.data || {})),
+        reservedTokens: reservation.reserved,
+        cap: capResult.lifetimeCap,
+        sessionId: session_id
+      });
+
+      const usedAfter = recorded.commitResult ? recorded.commitResult.used : reservation.used;
+      res.setHeader('X-Albion-Active-Model', FREE_TIER_MODEL_ID);
+      res.setHeader('X-Albion-Current-Tokens', String(usedAfter));
+      res.setHeader(
+        'X-Albion-Usage-Percent',
+        Number(((usedAfter / capResult.lifetimeCap) * 100).toFixed(2)).toString()
+      );
+      res.setHeader('X-Albion-Free-Tier-Tokens-Used', String(usedAfter));
+      res.setHeader('X-Albion-Free-Tier-Remaining', String(Math.max(0, capResult.lifetimeCap - usedAfter)));
+      res.setHeader('X-Albion-Free-Tier-Cost-Usd', recorded.costUsd.toFixed(8));
       return res.json(freeResult.data);
+    }
+
+    // Paid tier: caps exhausted -> 402. Never downgrade to a free provider.
+    if (capResult.allCapsExhausted || !targetModel) {
+      return res.status(402).json({
+        error: 'Your plan token cap is exhausted. Please top up or upgrade to continue.',
+        cap_exceeded: true,
+        tier: capResult.tier
+      });
     }
 
     // STEP 5b: Paid tier → DeepInfra Native Routing (or LiteLLM fallback)
@@ -1309,48 +1376,10 @@ async function openAIChatCompletionsHandler(req, res) {
         body: JSON.stringify(passBody)
       });
 
-      // Wallet unfunded (402) - Gracefully fail over to Stacked Free Tier
+      // Wallet unfunded (402) -> 503. No fallback to another provider or free tier.
       if (providerResponse.status === 402) {
-        console.warn(`[PAID-ROUTER] DeepInfra returned 402 (Wallet requires top-up) for user ${userId}. Gracefully falling back to Stacked Free Tier.`);
-        res.setHeader('X-Albion-Paid-Notice', 'DeepInfra wallet top-up needed; free tier fallback active');
-        if (stream) {
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Accel-Buffering', 'no');
-          res.setHeader('X-Albion-Active-Model', 'openrouter-free');
-
-          const orRes = await fetch(req.headers['x-albion-mock-provider-url'] || process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${getApiKey()}`,
-              'HTTP-Referer': 'https://albion.dev',
-              'X-Title': 'Albion Editor'
-            },
-            body: JSON.stringify({
-              model: OPENROUTER_FREE_MODEL,
-              messages: orderedMessages,
-              stream: true,
-              ...(req.body.tools ? { tools: req.body.tools } : {}),
-              ...(req.body.tool_choice ? { tool_choice: req.body.tool_choice } : {})
-            })
-          });
-          if (orRes.ok) {
-            pipeResponseBody(orRes, res);
-            return;
-          }
-        } else {
-          const freeResult = await dispatchFreeTierChat(orderedMessages, {
-            userId,
-            project_path,
-            mockEndpoint: req.headers['x-albion-mock-provider-url']
-          });
-          if (freeResult.success) {
-            res.setHeader('X-Albion-Active-Model', freeResult.model);
-            return res.json(freeResult.data);
-          }
-        }
+        console.error(`[PAID-ROUTER] DeepInfra returned 402 (wallet top-up required) for user ${userId}. No fallback configured.`);
+        return res.status(503).json({ error: 'AI provider is temporarily unavailable. Please try again shortly.' });
       }
     } else {
       const passBody = {
@@ -1399,19 +1428,17 @@ async function openAIChatCompletionsHandler(req, res) {
     const data = await providerResponse.json();
 
     // Log usage for paid models (same as /chat STEP 7)
-    if (!FREE_TIER_MODELS.has(targetModel)) {
-      const { error: logError } = await supabase.from('usage_logs').insert({
-        user_id: userId,
-        model: targetModel,
-        prompt_tokens: data.usage?.prompt_tokens || 0,
-        completion_tokens: data.usage?.completion_tokens || 0,
-        actual_cost: data.metadata?.cost || 0,
-        session_id: session_id || null,
-        timestamp: new Date().toISOString()
-      });
-      if (logError) {
-        console.error(`[ALIAS] Failed to log usage for user ${userId}:`, logError.message);
-      }
+    const { error: logError } = await supabase.from('usage_logs').insert({
+      user_id: userId,
+      model: targetModel,
+      prompt_tokens: data.usage?.prompt_tokens || 0,
+      completion_tokens: data.usage?.completion_tokens || 0,
+      actual_cost: data.metadata?.cost || 0,
+      session_id: session_id || null,
+      timestamp: new Date().toISOString()
+    });
+    if (logError) {
+      console.error(`[ALIAS] Failed to log usage for user ${userId}:`, logError.message);
     }
 
     return res.json(data);
@@ -1421,8 +1448,8 @@ async function openAIChatCompletionsHandler(req, res) {
       Sentry.captureException(err, { user: { id: userId } });
     }
     console.error(`[ALIAS] Error for user ${userId}:`, err.message);
-    if (typeof targetModel !== 'undefined' && FREE_TIER_MODELS.has(targetModel)) {
-      return res.status(503).json({ error: DAILY_FREE_LIMIT_MESSAGE });
+    if (isFreeTierRequest) {
+      return res.status(503).json({ error: 'Free tier provider is temporarily unavailable. Please try again shortly.' });
     }
     return res.status(502).json({ error: 'Provider unavailable. Retrying...', retry_after: 2000 });
   }
@@ -1896,11 +1923,10 @@ app.get('/api/pricing', authenticate, async (req, res) => {
       return res.json(rows);
     }
 
-    // Default seed fallback if DB table not populated yet
+    // Default seed fallback if DB table not populated yet.
+    // DeepSeek V4.1 Flash blended rate: $0.156 / 1M tokens => $0.000156 / 1K.
     const fallback = [
-      { model: 'openrouter-free', cost_per_1k: 0, currency: 'NGN' },
-      { model: 'groq-free', cost_per_1k: 0, currency: 'NGN' },
-      { model: 'deepseek-v4-flash', cost_per_1k: 0.00014, currency: 'USD' },
+      { model: 'deepseek-v4-flash', cost_per_1k: 0.000156, currency: 'USD' },
       { model: 'qwen3.6-35b-a3b', cost_per_1k: 0.00025, currency: 'USD' },
       { model: 'deepseek-v4-pro', cost_per_1k: 0.00219, currency: 'USD' },
       { model: 'glm-5.2', cost_per_1k: 0.00175, currency: 'USD' }
@@ -1921,7 +1947,7 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
   try {
     const { data: subscription, error: subError } = await supabase
       .from('subscriptions')
-      .select('tier, cycle_start, daily_request_count, daily_token_count, daily_reset_date')
+      .select('tier, cycle_start')
       .eq('user_id', userId)
       .eq('status', 'active')
       .maybeSingle();
@@ -1930,9 +1956,58 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
     if (!subError && subscription && subscription.tier && tierCaps[subscription.tier]) {
       tier = subscription.tier;
     }
-    const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
 
-    const currentTierCaps = tierCaps[tier] || tierCaps.free;
+    // Free tier: one lifetime allowance, never resets. Read from the atomic
+    // user_token_usage ledger rather than usage_logs so pending reservations
+    // are reflected immediately.
+    if (tier === 'free') {
+      let usage;
+      try {
+        usage = await freeTierAccounting.getUsage(userId);
+      } catch (err) {
+        console.error(`[CAPS] Free tier usage read failed for ${userId}:`, err.message);
+        return res.status(503).json({ error: 'Free tier accounting is temporarily unavailable.' });
+      }
+
+      const lifetimeTokens = usage.lifetimeTokens;
+      const lifetimeCap = FREE_TIER_TOKEN_CAP;
+      const lifetimeRemaining = Math.max(0, lifetimeCap - lifetimeTokens);
+      const lifetimePercent = Math.min(100, Number(((lifetimeTokens / lifetimeCap) * 100).toFixed(2)));
+      const lifetimeLocked = lifetimeTokens >= lifetimeCap;
+      const lifetimeCostUsd = Number(usage.lifetimeCostUsd.toFixed(8));
+
+      const caps = {
+        [FREE_TIER_MODEL_ID]: { used: lifetimeTokens, limit: lifetimeCap }
+      };
+
+      return res.json({
+        tier: 'free',
+        caps,
+        models: caps,
+        model: FREE_TIER_MODEL_ID,
+        lifetime_tokens: lifetimeTokens,
+        lifetime_prompt_tokens: usage.lifetimePromptTokens,
+        lifetime_completion_tokens: usage.lifetimeCompletionTokens,
+        lifetime_cap: lifetimeCap,
+        lifetime_remaining: lifetimeRemaining,
+        lifetime_percent: lifetimePercent,
+        lifetime_locked: lifetimeLocked,
+        lifetime_cost_usd: lifetimeCostUsd,
+        lifetime_cost_ngn: Number((lifetimeCostUsd * USD_TO_NGN).toFixed(2)),
+        lifetime_resets: false,
+        resets_at: null,
+        reset_time: null,
+        cap_exceeded: lifetimeLocked,
+        // Legacy compatibility fields. Daily limits no longer exist.
+        daily_requests: 0,
+        daily_tokens: lifetimeTokens,
+        limit_requests: null,
+        limit_tokens: lifetimeCap
+      });
+    }
+
+    const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
+    const currentTierCaps = tierCaps[tier] || {};
     const modelUsage = {};
 
     const { data: logs, error: logsError } = await supabase
@@ -1949,7 +2024,7 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
       }
     }
 
-    const trackedModels = ['deepseek-v4-flash', 'deepseek-v4-pro', 'qwen3.6-35b-a3b', 'glm-5.2', 'openrouter-free', 'groq-free'];
+    const trackedModels = Object.keys(currentTierCaps);
     const caps = {};
 
     for (const m of trackedModels) {
@@ -1961,46 +2036,31 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
       };
     }
 
-    // Calculate midnight UTC start of day for Free Tier daily usage
-    const now = new Date();
-    const startOfDayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    const todayDateStr = startOfDayUTC.toISOString().slice(0, 10);
-
-    let dailyRequests = 0;
-    let dailyTokens = 0;
-
-    if (subscription) {
-      const resetDate = subscription.daily_reset_date ? String(subscription.daily_reset_date).slice(0, 10) : null;
-      if (resetDate === todayDateStr) {
-        dailyRequests = Number(subscription.daily_request_count) || 0;
-        dailyTokens = Number(subscription.daily_token_count) || 0;
-      }
-    }
-
-    try {
-      const { data: dayLogs, error: dayLogsErr } = await supabase
-        .from('usage_logs')
-        .select('prompt_tokens, completion_tokens')
-        .eq('user_id', userId)
-        .gte('timestamp', startOfDayUTC.toISOString());
-
-      if (!dayLogsErr && Array.isArray(dayLogs)) {
-        dailyRequests = Math.max(dailyRequests, dayLogs.length);
-        dailyTokens = Math.max(dailyTokens, dayLogs.reduce((acc, row) => acc + (row.prompt_tokens || 0) + (row.completion_tokens || 0), 0));
-      }
-    } catch (_) {}
-
-    const capExceeded = tier === 'free' && (dailyRequests >= FREE_TIER_DAILY_REQUEST_LIMIT || dailyTokens >= FREE_TIER_DAILY_TOKEN_LIMIT);
+    const capExceeded =
+      trackedModels.length > 0 &&
+      trackedModels.every((m) => {
+        const limit = caps[m].limit;
+        return limit >= 0 && caps[m].used >= limit;
+      });
 
     return res.json({
       tier,
       caps,
       models: caps,
-      daily_requests: dailyRequests,
-      daily_tokens: dailyTokens,
-      limit_requests: FREE_TIER_DAILY_REQUEST_LIMIT,
-      limit_tokens: FREE_TIER_DAILY_TOKEN_LIMIT,
-      cap_exceeded: capExceeded
+      lifetime_tokens: null,
+      lifetime_cap: null,
+      lifetime_remaining: null,
+      lifetime_percent: null,
+      lifetime_locked: false,
+      lifetime_cost_usd: null,
+      lifetime_resets: false,
+      resets_at: null,
+      cap_exceeded: capExceeded,
+      // Legacy compatibility fields.
+      daily_requests: 0,
+      daily_tokens: 0,
+      limit_requests: null,
+      limit_tokens: null
     });
   } catch (err) {
     console.error(`[CAPS] Error fetching caps for user ${userId}:`, err.message);
@@ -2341,8 +2401,11 @@ module.exports = {
   checkCapBeforeRoute,
   tierCaps,
   FREE_TIER_MODELS,
+  FREE_TIER_MODEL_ID,
+  FREE_TIER_TOKEN_CAP,
+  FREE_TIER_LIMIT_MESSAGE,
   DAILY_FREE_LIMIT_MESSAGE,
-  OPENROUTER_FREE_MODEL,
+  freeTierAccounting,
   getApiKey,
   rotateApiKey,
   loadOpenRouterKeys,
