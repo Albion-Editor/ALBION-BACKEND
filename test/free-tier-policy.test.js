@@ -15,23 +15,23 @@ const {
 	getFreeTierLimitMessage
 } = require('../lib/freeTierPolicy');
 
-test('free tier default cap is a 200k lifetime allowance', () => {
-	assert.equal(DEFAULT_FREE_TIER_TOKEN_CAP, 200000);
-	assert.equal(FREE_TIER_MODEL_ID, 'deepseek-v4-flash');
+test('free tier default cap is a 100k lifetime allowance', () => {
+	assert.equal(DEFAULT_FREE_TIER_TOKEN_CAP, 100000);
+	assert.equal(FREE_TIER_MODEL_ID, 'qwen/qwen3-coder-30b-a3b-instruct');
 });
 
-test('199k used + 2k estimated is blocked with 402', () => {
-	const result = evaluateFreeTierRequest({ usedTokens: 199000, estimatedTokens: 2000 });
+test('99k used + 2k estimated is blocked with 402', () => {
+	const result = evaluateFreeTierRequest({ usedTokens: 99000, estimatedTokens: 2000 });
 	assert.equal(result.allowed, false);
 	assert.equal(result.blocked, true);
 	assert.equal(result.status, 402);
 	assert.equal(result.reason, 'free_tier_lifetime_limit_reached');
 	assert.equal(result.remaining, 1000);
-	assert.equal(result.message, 'Free tier lifetime limit reached (200k tokens). Please upgrade to continue.');
+	assert.equal(result.message, 'Free tier lifetime limit reached (100k tokens). Please upgrade to continue.');
 });
 
-test('199k used + 1k estimated is allowed', () => {
-	const result = evaluateFreeTierRequest({ usedTokens: 199000, estimatedTokens: 1000 });
+test('99k used + 1k estimated is allowed', () => {
+	const result = evaluateFreeTierRequest({ usedTokens: 99000, estimatedTokens: 1000 });
 	assert.equal(result.allowed, true);
 	assert.equal(result.blocked, false);
 	assert.equal(result.status, 200);
@@ -39,7 +39,7 @@ test('199k used + 1k estimated is allowed', () => {
 });
 
 test('exhausted lifetime usage is permanently locked', () => {
-	const result = evaluateFreeTierRequest({ usedTokens: 200000, estimatedTokens: 0 });
+	const result = evaluateFreeTierRequest({ usedTokens: 100000, estimatedTokens: 0 });
 	assert.equal(result.blocked, true);
 	assert.equal(result.locked, true);
 	assert.equal(result.remaining, 0);
